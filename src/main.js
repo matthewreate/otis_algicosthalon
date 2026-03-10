@@ -10,6 +10,7 @@ import {
 import { createSeason, applyEventResults, getLeaderboard, getNextEventType } from './season.js'
 import { createEventSimulation } from './simulation.js'
 
+const DEBUG_ENABLED = import.meta.env.MODE === 'e2e'
 const app = document.querySelector('#app')
 
 app.innerHTML = `
@@ -34,44 +35,49 @@ app.innerHTML = `
       </div>
     </header>
     <main class="layout">
-      <section class="stage-panel">
+      <section class="stage-panel" data-testid="stage-panel">
         <div class="stage-header">
           <div>
-            <p id="round-label" class="panel-kicker"></p>
-            <h2 id="event-name"></h2>
+            <p id="round-label" class="panel-kicker" data-testid="round-label"></p>
+            <h2 id="event-name" data-testid="event-name"></h2>
           </div>
-          <p id="event-description" class="event-copy"></p>
+          <p id="event-description" class="event-copy" data-testid="event-description"></p>
         </div>
-        <canvas id="sim-canvas" width="${CANVAS_SIZE.width}" height="${CANVAS_SIZE.height}"></canvas>
+        <canvas
+          id="sim-canvas"
+          data-testid="sim-canvas"
+          width="${CANVAS_SIZE.width}"
+          height="${CANVAS_SIZE.height}"
+        ></canvas>
         <div class="controls">
-          <button id="new-season-btn" class="primary">Start New Season</button>
-          <button id="run-event-btn">Run Event</button>
-          <button id="next-event-btn">Next Event</button>
-          <button id="reset-btn">Reset</button>
+          <button id="new-season-btn" class="primary" data-testid="new-season-button">Start New Season</button>
+          <button id="run-event-btn" data-testid="run-event-button">Run Event</button>
+          <button id="next-event-btn" data-testid="next-event-button">Next Event</button>
+          <button id="reset-btn" data-testid="reset-button">Reset</button>
           <label class="speed-control">
             Speed
-            <select id="speed-select">
+            <select id="speed-select" data-testid="speed-select">
               ${SPEED_OPTIONS.map((value) => `<option value="${value}">${value}x</option>`).join('')}
             </select>
           </label>
         </div>
       </section>
       <aside class="sidebar">
-        <section class="panel banner-panel">
+        <section class="panel banner-panel" data-testid="status-panel">
           <p class="panel-kicker">Status</p>
-          <h3 id="status-line"></h3>
-          <p id="notice-line" class="notice-line"></p>
+          <h3 id="status-line" data-testid="status-line"></h3>
+          <p id="notice-line" class="notice-line" data-testid="notice-line"></p>
         </section>
-        <section class="panel">
+        <section class="panel" data-testid="summary-panel">
           <p class="panel-kicker">Round Summary</p>
-          <div id="summary-card" class="summary-card"></div>
+          <div id="summary-card" class="summary-card" data-testid="summary-card"></div>
         </section>
-        <section class="panel">
+        <section class="panel" data-testid="leaderboard-panel">
           <div class="leaderboard-head">
             <p class="panel-kicker">Leaderboard</p>
-            <span id="active-count" class="tag"></span>
+            <span id="active-count" class="tag" data-testid="active-count"></span>
           </div>
-          <div id="leaderboard" class="leaderboard"></div>
+          <div id="leaderboard" class="leaderboard" data-testid="leaderboard"></div>
         </section>
       </aside>
     </main>
@@ -101,6 +107,14 @@ const runtime = {
   lastFrameTime: 0,
 }
 
+function getSeasonSeed(state) {
+  return state?.season.seed ?? null
+}
+
+function getEventSeed(state, eventType = getNextEventType(state)) {
+  return `${getSeasonSeed(state)}:${state.season.round}:${eventType}`
+}
+
 function createSeed() {
   return `${Date.now()}-${Math.floor(Math.random() * 100000)}`
 }
@@ -116,27 +130,63 @@ function getActiveAthletes(state) {
   return state.season.activeAthleteIds.map((athleteId) => state.athletes[athleteId])
 }
 
+function createSimulationForState(state) {
+  const eventType = getNextEventType(state)
+  if (!eventType) {
+    return null
+  }
+
+  return createEventSimulation(
+    eventType,
+    getActiveAthletes(state),
+    getEventSeed(state, eventType),
+  )
+}
+
 function mountSimulation() {
   destroySimulation()
-  const eventType = getNextEventType(runtime.state)
-  if (!eventType) {
+  runtime.simulation = createSimulationForState(runtime.state)
+}
+
+function setSelectedSpeed(speed) {
+  const normalizedSpeed = Number(speed)
+  if (!Number.isFinite(normalizedSpeed) || normalizedSpeed <= 0) {
     return
   }
 
-  runtime.simulation = createEventSimulation(
-    eventType,
-    getActiveAthletes(runtime.state),
-    `${runtime.state.season.seed}:${runtime.state.season.round}:${eventType}`,
-  )
+  runtime.state.ui.selectedSpeed = normalizedSpeed
+  speedSelect.value = SPEED_OPTIONS.includes(normalizedSpeed) ? String(normalizedSpeed) : ''
 }
 
 function startSeason(seed) {
   const preservedSpeed = runtime.state?.ui.selectedSpeed ?? 1
   runtime.state = createSeason(seed)
-  runtime.state.ui.selectedSpeed = preservedSpeed
-  speedSelect.value = String(preservedSpeed)
+  setSelectedSpeed(preservedSpeed)
   mountSimulation()
   render()
+}
+
+function advanceStateThroughCurrentRound(state, speed = 30) {
+  const simulation = createSimulationForState(state)
+  if (!simulation) {
+    return state
+  }
+
+  simulation.start()
+  let guard = 0
+  while (!simulation.isComplete() && guard < 4000) {
+    simulation.update(1000 / 60, speed)
+    guard += 1
+  }
+
+  if (!simulation.isComplete()) {
+    simulation.destroy()
+    throw new Error('Simulation did not complete during debug advance.')
+  }
+
+  const { updatedSeason } = applyEventResults(state, simulation.getResults())
+  simulation.destroy()
+  return updatedSeason
 }
 
 function formatStatus() {
@@ -260,6 +310,124 @@ function finalizeEventIfNeeded() {
   render()
 }
 
+function prepareNextRound() {
+  if (runtime.state.ui.phase !== UI_PHASES.RESULTS || runtime.state.season.winner) {
+    return false
+  }
+
+  runtime.state.ui.phase = UI_PHASES.READY
+  mountSimulation()
+  render()
+  return true
+}
+
+function getDebugSnapshot() {
+  const standings = getLeaderboard(runtime.state)
+  return {
+    phase: runtime.state.ui.phase,
+    round: runtime.state.season.round,
+    currentEvent: runtime.simulation?.eventType ?? getNextEventType(runtime.state),
+    activeAthleteCount: runtime.state.season.activeAthleteIds.length,
+    seed: runtime.state.season.seed,
+    latestResults: runtime.state.ui.lastResults
+      ? {
+          eventType: runtime.state.ui.lastResults.eventType,
+          placements: runtime.state.ui.lastResults.placements.map((entry) => ({ ...entry })),
+        }
+      : null,
+    eliminationNotice: runtime.state.ui.eliminationNotice,
+    champion: runtime.state.season.winner
+      ? {
+          id: runtime.state.season.winner.id,
+          name: runtime.state.season.winner.name,
+          score: runtime.state.season.winner.score,
+        }
+      : null,
+    leaderboard: standings.map((athlete) => ({
+      id: athlete.id,
+      name: athlete.name,
+      score: athlete.score,
+      eliminated: athlete.eliminated,
+      topThreeCount: athlete.topThreeCount,
+      lastPlacement: athlete.lastPlacement,
+    })),
+  }
+}
+
+function installDebugApi() {
+  if (!DEBUG_ENABLED) {
+    return
+  }
+
+  Object.defineProperty(window, '__ALGICO_DEBUG__', {
+    configurable: true,
+    value: Object.freeze({
+      getSnapshot() {
+        return getDebugSnapshot()
+      },
+      setSpeed(speed) {
+        setSelectedSpeed(speed)
+        render()
+        return getDebugSnapshot()
+      },
+      startSeason(seed = createSeed()) {
+        startSeason(String(seed))
+        return getDebugSnapshot()
+      },
+      resetSeason() {
+        startSeason(runtime.state.season.seed)
+        return getDebugSnapshot()
+      },
+      prepareRound({
+        seed = runtime.state.season.seed,
+        round = 1,
+        speed = runtime.state.ui.selectedSpeed,
+      } = {}) {
+        startSeason(String(seed))
+        setSelectedSpeed(speed)
+
+        while (runtime.state.season.round < Math.max(0, round - 1) && !runtime.state.season.winner) {
+          runtime.state = advanceStateThroughCurrentRound(runtime.state, speed)
+        }
+
+        runtime.state.ui.phase = runtime.state.season.winner ? UI_PHASES.COMPLETE : UI_PHASES.READY
+        mountSimulation()
+        render()
+        return getDebugSnapshot()
+      },
+      completeCurrentRound(speed = runtime.state.ui.selectedSpeed) {
+        if (!runtime.simulation) {
+          mountSimulation()
+        }
+        if (!runtime.simulation) {
+          return getDebugSnapshot()
+        }
+
+        setSelectedSpeed(speed)
+        runtime.simulation.start()
+        runtime.state.ui.phase = UI_PHASES.RUNNING
+
+        let guard = 0
+        while (!runtime.simulation.isComplete() && guard < 4000) {
+          runtime.simulation.update(1000 / 60, speed)
+          guard += 1
+        }
+
+        if (!runtime.simulation.isComplete()) {
+          throw new Error('Simulation did not complete during browser smoke test.')
+        }
+
+        finalizeEventIfNeeded()
+        return getDebugSnapshot()
+      },
+      prepareNextRound() {
+        prepareNextRound()
+        return getDebugSnapshot()
+      },
+    }),
+  })
+}
+
 function animationLoop(timestamp) {
   if (!runtime.lastFrameTime) {
     runtime.lastFrameTime = timestamp
@@ -287,13 +455,9 @@ runEventButton.addEventListener('click', () => {
 })
 
 nextEventButton.addEventListener('click', () => {
-  if (runtime.state.ui.phase !== UI_PHASES.RESULTS) {
+  if (!prepareNextRound()) {
     return
   }
-
-  runtime.state.ui.phase = UI_PHASES.READY
-  mountSimulation()
-  render()
 })
 
 newSeasonButton.addEventListener('click', () => {
@@ -305,8 +469,9 @@ resetButton.addEventListener('click', () => {
 })
 
 speedSelect.addEventListener('change', (event) => {
-  runtime.state.ui.selectedSpeed = Number(event.target.value)
+  setSelectedSpeed(event.target.value)
 })
 
 startSeason(createSeed())
+installDebugApi()
 runtime.frameId = window.requestAnimationFrame(animationLoop)
